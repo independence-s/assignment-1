@@ -106,7 +106,11 @@ class ChessAgent(Agent):
             compaction_max_tokens=compaction_max_tokens,
         )
 
-        # TODO(Part 3): Register the play_move tool schema from tools.py.
+        # Register the chess tool schemas. play_move is always available;
+        # simulate_move and run_python appear only with programmatic tools.
+        self.tools.append(PLAY_MOVE_TOOL)
+        if programmatic_tools:
+            self.tools.append(SIMULATE_MOVE_TOOL)
 
         if programmatic_tools:
             self.tools.append(RUN_PYTHON_TOOL)
@@ -161,20 +165,93 @@ class ChessAgent(Agent):
     def execute_tool_calls(
         self, tool_calls: list[dict[str, Any]]
     ) -> list[dict[str, str]]:
-        """Execute model-generated ``play_move`` calls against the chess API."""
+        """Execute model-generated tool calls against the chess API."""
 
-        # TODO(Part 3.1):
-        # 1. Dispatch on the function name, and ignore a tool this agent did
-        #    not register.
-        # 2. Hand the raw arguments to the matching chess_tools helper, with
-        #    self.chess_client as its first argument. Each helper takes the
-        #    client explicitly so the same code can run inside the sandbox.
-        # 3. Format a played move with self.format_state, then update
-        #    last_state and finished.
-        # 4. Link every observation to its call with tool_call_id.
-        # 5. Turn malformed, unknown, rejected, or extra parallel calls into
-        #    recoverable <chess_error> observations instead of crashing.
+        observations: list[dict[str, str]] = []
+        move_played = False
+        for call in tool_calls:
+            call_id = call.get("id") or "unknown"
+            function = call.get("function", {}) if isinstance(call, dict) else {}
+            name = function.get("name")
+            arguments = function.get("arguments", "")
 
-        # TODO(Part 3.3-4): add cases for simulate_move and run_python, with
-        # linked observations and recoverable errors, just like the old tool.
-        raise NotImplementedError
+            if name == "play_move":
+                if move_played:
+                    observations.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": (
+                                "<chess_error>Only one play_move can be played "
+                                "per turn; the position changed after the first "
+                                "move. Read the returned board and choose again "
+                                "next turn.</chess_error>"
+                            ),
+                        }
+                    )
+                    continue
+                result = _play_move(self.chess_client, arguments)
+                if result.startswith("<chess_error>"):
+                    # Rejected or malformed moves are recoverable observations.
+                    observations.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": result,
+                        }
+                    )
+                else:
+                    state = json.loads(result)
+                    move_played = True
+                    observations.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": self.format_state(state),
+                        }
+                    )
+                    self.last_state = state
+                    self.finished = bool(state.get("game_over"))
+            elif name == "simulate_move":
+                observations.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": _simulate_move(self.chess_client, arguments),
+                    }
+                )
+            elif name == "run_python":
+                result = _run_python(self.env, self.python_sandbox_port, arguments)
+                # The snippet may have committed a move, so re-read the live
+                # board; otherwise the model could replay a move already played.
+                state = _game_state(self.chess_client, reset=False)
+                self.last_state = state
+                self.finished = bool(state.get("game_over"))
+                observations.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": result + "\n" + self.format_state(state),
+                    }
+                )
+            elif name == "invoke_skill":
+                observations.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": _invoke_skill(self.skills, arguments),
+                    }
+                )
+            else:
+                observations.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": (
+                            f"<chess_error>Unknown tool `{name}`; nothing was "
+                            "executed.</chess_error>"
+                        ),
+                    }
+                )
+        return observations
+

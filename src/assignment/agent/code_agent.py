@@ -9,8 +9,10 @@ from assignment.agent.base import (
     DEFAULT_COMPACTION_KEEP_RECENT_STEPS,
     DEFAULT_COMPACTION_MAX_TOKENS,
     Agent,
+    format_tool_output,
 )
 from assignment.agent.tools import EXECUTE_TOOL, SEND_MESSAGE_TOOL
+from assignment.agent.chess_tools import _invoke_skill
 from assignment.env import Environment
 
 class CodeAgent(Agent):
@@ -43,21 +45,177 @@ class CodeAgent(Agent):
         self.task = task
         self.submitted_patch = ""
 
-        # TODO(Part 1.3): Make the `execute` and `send_message` tools available
-        # to the agent.
+        # Make the two coding tools available to the model, alongside any
+        # invoke_skill tool that Agent registered for loaded skills.
+        self.tools.append(EXECUTE_TOOL)
+        self.tools.append(SEND_MESSAGE_TOOL)
 
-        # TODO(1.1.b): Construct the system prompt and task_prompt. These
-        # should be usable by the `Agent.build_prompt` method.
-        # TODO(1.4): If any skills are available to the agent, make their
-        # descriptions/metadata available to the agent in the prompt.
+        env = self.env
+        environment_info = {
+            "machine": getattr(env, "machine", "unknown"),
+            "release": getattr(env, "release", "unknown"),
+            "system": getattr(env, "system", "unknown"),
+            "version": getattr(env, "version", "unknown"),
+        }
+        self.system_prompt = (
+            "<system_information>\n"
+            f"{json.dumps(environment_info, indent=2)}\n"
+            "</system_information>\n"
+            "\n"
+            "You are a coding agent operating in the terminal described above. "
+            "You are given a software task to solve: inspect the code, reproduce "
+            "the problem, modify source files, and verify the fix by running "
+            "tests or commands.\n"
+            "\n"
+            "Use the `execute` tool to run bash commands. After every result, "
+            "reason in your message text about what it means, then take the next "
+            "step. A non-zero exit code is a recoverable observation: read the "
+            "output, adjust, and retry rather than giving up. Prefer commands "
+            "that produce little output; when reading a file, use `head`, `tail`, "
+            "or `sed -n` ranges instead of printing it all. Every command runs in "
+            "a fresh subshell, so pass `cwd`/`env` arguments when a command needs "
+            "a directory or environment.\n"
+            "\n"
+            "Work until the task is genuinely solved and verified, then send the "
+            "user a concise summary of what you changed and the evidence it works "
+            "with the `send_message` tool. Never claim success without having run "
+            "the relevant tests or commands yourself."
+        )
+        if self.skills:
+            catalog = "\n".join(skill["metadata"] for skill in self.skills.values())
+            self.system_prompt += (
+                "\n\nReusable skills are available. Call `invoke_skill` with a "
+                "skill's name to load its instructions, and follow them in place "
+                f"of your default approach.\n\n<skills>\n{catalog}\n</skills>\n"
+            )
+        working_directory = getattr(env, "cwd", "/")
+        self.task_prompt = (
+            f"Task: {self.task}\n\n"
+            f"You are working in a terminal whose current directory is "
+            f"{working_directory}. Solve the task there by running commands and "
+            "editing files."
+        )
 
     def execute_tool_calls(
         self, tool_calls: list[dict[str, Any]]
     ) -> list[dict[str, str]]:
         """Execute ``execute`` and ``send_message`` calls in the code sandbox."""
 
-        # TODO(Part 1.3): Parse each call, execute recognized tools, and return
-        # one message per call (there may be multiple tool calls in one agent
-        # response!). Malformed JSON and unknown tools must become recoverable
-        # observations relayed to the agent instead of exceptions.
-        raise NotImplementedError
+        observations: list[dict[str, str]] = []
+        for call in tool_calls:
+            call_id = call.get("id") or "unknown"
+            function = call.get("function", {}) if isinstance(call, dict) else {}
+            name = function.get("name")
+            raw_arguments = function.get("arguments", "")
+
+            # Malformed JSON becomes a recoverable observation: nothing runs and
+            # the agent hears what went wrong instead of the run crashing.
+            try:
+                arguments = (
+                    json.loads(raw_arguments)
+                    if isinstance(raw_arguments, str)
+                    else raw_arguments
+                )
+                if not isinstance(arguments, dict):
+                    raise ValueError("tool arguments must be a JSON object")
+            except (json.JSONDecodeError, ValueError) as exc:
+                observations.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": (
+                            f"<tool_error>Malformed JSON arguments to "
+                            f"`{name}`: {exc}. Nothing was executed.</tool_error>"
+                        ),
+                    }
+                )
+                continue
+
+            if name == "execute":
+                observations.append(
+                    self._execute_command(call_id, arguments)
+                )
+            elif name == "send_message":
+                summary = arguments.get("summary")
+                if not isinstance(summary, str):
+                    observations.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": (
+                                "<tool_error>send_message requires a string "
+                                "`summary` argument.</tool_error>"
+                            ),
+                        }
+                    )
+                else:
+                    observations.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": f"Message sent to the user:\n{summary}",
+                        }
+                    )
+                    # A message bound for the user is the agent's closing act.
+                    self.finished = True
+            elif name == "invoke_skill":
+                observations.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": _invoke_skill(self.skills, json.dumps(arguments)),
+                    }
+                )
+            else:
+                observations.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": (
+                            f"<tool_error>Unknown tool `{name}`. "
+                            "Nothing was executed.</tool_error>"
+                        ),
+                    }
+                )
+        return observations
+
+    def _execute_command(
+        self, call_id: str, arguments: dict[str, Any]
+    ) -> dict[str, str]:
+        """Run one ``execute`` call, forwarding any optional arguments."""
+
+        command = arguments.get("command")
+        if not isinstance(command, (str, list)):
+            return {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": (
+                    "<tool_error>execute requires a string or list `command` "
+                    "argument. Nothing was executed.</tool_error>"
+                ),
+            }
+        try:
+            result = self.env.execute(
+                command=command,
+                timeout=arguments.get("timeout"),
+                cwd=arguments.get("cwd"),
+                env=arguments.get("env"),
+                shell=arguments.get("shell"),
+            )
+        except Exception as exc:  # noqa: BLE001 - relay, do not crash
+            return {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": (
+                    f"<tool_error>The command could not be executed: "
+                    f"{type(exc).__name__}: {exc}</tool_error>"
+                ),
+            }
+        if not isinstance(result, dict):
+            result = {"output": str(result), "returncode": None}
+        return {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": format_tool_output(result),
+        }
+

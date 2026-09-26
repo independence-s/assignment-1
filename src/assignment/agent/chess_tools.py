@@ -45,14 +45,23 @@ def _simulate_move(client: httpx.Client, arguments: str) -> str:
     to send back, so a bad argument or a server error reaches the model as a
     recoverable ``<chess_error>`` instead of ending the run.
     """
-    # TODO(Part 3.3.b): Parse the arguments, call the provided
-    # /api/simulate endpoint with fen and optional move, and return its JSON.
-    # Catch any errors raised by the tool and return an error message between
-    # `<chess_error></chess_error>` for the agent to address. Cover malformed
-    # JSON arguments, arguments that are not an object, a missing or
-    # non-string fen, a non-string move, a position or move the server rejects,
-    # and a transport failure.
-    raise NotImplementedError
+    try:
+        parsed = json.loads(arguments)
+        if not isinstance(parsed, dict):
+            raise ValueError("arguments must be a JSON object")
+        fen = parsed.get("fen")
+        if not isinstance(fen, str) or not fen:
+            raise ValueError("simulate_move requires a string `fen` argument")
+        move = parsed.get("move")
+        if move is not None and not isinstance(move, str):
+            raise ValueError("`move` must be a string when provided")
+        payload = {"fen": fen}
+        if move is not None:
+            payload["move"] = move
+        state = _request_state(client, "POST", "/api/simulate", json=payload)
+        return json.dumps(state)
+    except Exception as exc:  # noqa: BLE001 - recoverable observation
+        return f"<chess_error>simulate_move failed: {exc}</chess_error>"
 
 
 def _play_move(client: httpx.Client, arguments: str) -> str:
@@ -61,13 +70,19 @@ def _play_move(client: httpx.Client, arguments: str) -> str:
     Takes the raw JSON arguments of one tool call. Returns the new state, or a
     `<chess_error>` observation if the move could not be played.
     """
-    # TODO(3.1.b): Parse the arguments and POST {"move": <uci move>} to
-    # /api/move. Return its JSON object. Catch any errors raised by the
-    # tool and return an error message between `<chess_error></chess_error>`
-    # for the agent to address. Cover malformed JSON arguments, arguments
-    # that are not an object, a missing or non-string fen, a non-string move,
-    # a position or move the server rejects, and a transport failure.
-    raise NotImplementedError
+    try:
+        parsed = json.loads(arguments)
+        if not isinstance(parsed, dict):
+            raise ValueError("arguments must be a JSON object")
+        move = parsed.get("move")
+        if not isinstance(move, str) or not move:
+            raise ValueError("play_move requires a string `move` argument")
+        state = _request_state(
+            client, "POST", "/api/move", json={"move": move}
+        )
+        return json.dumps(state)
+    except Exception as exc:  # noqa: BLE001 - recoverable observation
+        return f"<chess_error>play_move failed: {exc}</chess_error>"
 
 
 def _run_python(env: Any, port: int, arguments: str) -> str:
@@ -77,33 +92,54 @@ def _run_python(env: Any, port: int, arguments: str) -> str:
     implementations and the chess server, so code the model wrote never
     executes in the agent process.
     """
-    # TODO(3.4): parse the arguments and run the code in the
-    # sandbox with the registered tools available by name.
-    #
-    # `/opt/assignment/sandbox_python.py` is a script on the `env` sandbox
-    # that has access to the same tool definitions in this file. Use it to run
-    # the code that the model produced as an argument to the run_python tool.
-    # The script accepts two positional arguments -- `port` and a base64-encoded
-    # string of code (to prevent issues with quoting). Implement this tool
-    # call.
-    #
-    # The script prints one JSON object with `stdout`, `stderr`, and `error`
-    # from running the code -- return that string as it is.
-    #
-    # A non-zero returncode means the sandbox itself failed, not the model's
-    # code. Report `exception_info` or `stderr` as a <chess_error>.
-    #
-    # Return <chess_error>{message}</chess_error> if there are issues like type
-    # mismatches or parsing failures.
-    raise NotImplementedError
+    try:
+        parsed = json.loads(arguments)
+        if not isinstance(parsed, dict):
+            raise ValueError("arguments must be a JSON object")
+        code = parsed.get("code")
+        if not isinstance(code, str) or not code:
+            raise ValueError("run_python requires a string `code` argument")
+    except Exception as exc:  # noqa: BLE001 - recoverable observation
+        return f"<chess_error>run_python arguments invalid: {exc}</chess_error>"
+
+    encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
+    command = f"python /opt/assignment/sandbox_python.py {port} {encoded}"
+    try:
+        result = env.execute(command)
+    except Exception as exc:  # noqa: BLE001 - sandbox transport failure
+        return f"<chess_error>run_python could not run in the sandbox: {exc}</chess_error>"
+    if not isinstance(result, dict):
+        return f"<chess_error>run_python returned an unexpected result.</chess_error>"
+
+    output = result.get("output")
+    if output is None:
+        stderr = result.get("stderr") or ""
+        output = (result.get("stdout") or "") + (stderr if stderr else "")
+    if result.get("returncode") not in (0, None):
+        message = result.get("exception_info") or output or "non-zero exit code"
+        return f"<chess_error>sandbox runner failed: {message}</chess_error>"
+    # The runner prints one JSON object on stdout; relay it verbatim.
+    return str(output)
 
 
 def _invoke_skill(skills: dict[str, dict[str, str]], arguments: str) -> str:
     """Existing tool: load one skill's instructions into the conversation."""
-    # TODO(3.5): parse the arguments and return the named skill's content.
-    # Return <chess_error>{message}</chess_error> if there are issues like type
-    # mismatches or parsing failures.
-    raise NotImplementedError
+    try:
+        parsed = json.loads(arguments)
+        if not isinstance(parsed, dict):
+            raise ValueError("arguments must be a JSON object")
+        name = parsed.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("invoke_skill requires a string `name` argument")
+    except Exception as exc:  # noqa: BLE001 - recoverable observation
+        return f"<chess_error>invoke_skill arguments invalid: {exc}</chess_error>"
+    if name not in skills:
+        available = ", ".join(sorted(skills)) or "(none loaded)"
+        return (
+            f"<chess_error>No skill named '{name}'. "
+            f"Available skills: {available}</chess_error>"
+        )
+    return skills[name]["content"]
 
 
 def _game_state(client: httpx.Client, reset: bool = False) -> dict:
